@@ -10,6 +10,7 @@ import Landing from "@/pages/landing";
 import Features from "@/pages/features";
 import SmartDocumentation from "@/pages/smart-documentation";
 import InterviewCopilot from "@/pages/interview-copilot";
+import InterviewReview from "@/pages/interview-review";
 import Upload from "@/pages/upload";
 import UploadResume from "@/pages/upload-resume";
 import Login from "@/pages/login";
@@ -22,20 +23,36 @@ import AuthModal from "@/components/auth-modal";
 // Router Component
 function Router({
   isAuthenticated,
+  userEmail,
   onAuthModal,
+  onLogout,
 }: {
   isAuthenticated: boolean;
+  userEmail: string;
   onAuthModal: (type: "login" | "signup") => void;
+  onLogout: () => void;
 }) {
   return (
     <Switch>
       <Route path="/">
-        
         <Landing isAuthenticated={isAuthenticated} onAuthModal={onAuthModal} />
       </Route>
       <Route path="/features" component={Features} />
-      <Route path="/smart-documentation" component={SmartDocumentation} />
-      <Route path="/interview-copilot" component={InterviewCopilot} />
+      <Route path="/smart-documentation">
+        <SmartDocumentation 
+          isAuthenticated={isAuthenticated}
+          userEmail={userEmail}
+          onLogout={onLogout}
+        />
+      </Route>
+      <Route path="/interview-copilot">
+        <InterviewCopilot 
+          isAuthenticated={isAuthenticated}
+          userEmail={userEmail}
+          onLogout={onLogout}
+        />
+      </Route>
+      <Route path="/interview-review" component={InterviewReview} />
       <Route path="/upload" component={Upload} />
       <Route path="/upload-resume" component={UploadResume} />
       <Route path="/login" component={Login} />
@@ -104,7 +121,9 @@ function App() {
           <main className={!isFullscreenRoute ? "pt-16" : ""}>
             <Router
               isAuthenticated={isAuthenticated}
+              userEmail={userEmail}
               onAuthModal={setAuthModal}
+              onLogout={handleLogout}
             />
           </main>
 

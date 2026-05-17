@@ -231,6 +231,8 @@ import faiss
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 from dotenv import load_dotenv
+import json
+import os
 
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -334,17 +336,14 @@ def search_similar_chunks(
     return result
 
 
-# ---------------------
-# Gemini (strict context)
-# ---------------------
 def ask_gemini_with_context(query: str, context_chunks: List[str]) -> str:
+    """Ask Gemini a question using only the provided context chunks. Implements jittered exponential backoff on quota errors."""
     if not context_chunks:
-        return "Sorry — I can't answer that because the document doesn't contain relevant information."
+        return "Sorry — I cannot find the answer in the document."
 
     context_text = "\n\n---\n\n".join(context_chunks)
     prompt = f"""
-You are an assistant that answers ONLY from the provided context. If the answer is not present in the context, say:
-"I cannot find the answer in the document."
+You are a document Q&A assistant. Answer concisely and only using facts from the provided context. If the answer is not in the context, say: "I cannot find the answer in the document.".
 
 Context:
 {context_text}
@@ -352,27 +351,94 @@ Context:
 Question:
 {query}
 
-Answer (use only facts from the context; be concise):
+Answer:
 """
-    try:
-        # Use the generative model wrapper
-        model_name = "gemini-2.0-flash"
-        gmodel = genai.GenerativeModel(model_name=model_name)
 
-        # generate_content may accept a dict, simple prompt should still work in many wrappers:
-        response = gmodel.generate_content(prompt)
-        # Some versions return object with `.text`, some with `.candidates[0].content`.
-        text = ""
-        if hasattr(response, "text") and response.text:
-            text = response.text
-        elif hasattr(response, "candidates") and response.candidates:
-            text = response.candidates[0].content
-        else:
-            text = str(response)
-        return text.strip()
-    except Exception as e:
-        # Return an informative error to the caller (backend will relay nicely)
-        return f"Gemini API error: {repr(e)}"
+    import time
+    import random
+    import logging
+    import re
+
+    logger = logging.getLogger("gemini_retry")
+    if not logger.handlers:
+        fh = logging.FileHandler(os.path.join(os.path.dirname(__file__), "gemini_retry.log"))
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(fh)
+        logger.setLevel(logging.INFO)
+
+    max_retries = 5
+    backoff = 1.0
+    for attempt in range(max_retries):
+        try:
+    
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content(prompt)
+            text = ""
+            if hasattr(response, "text") and response.text:
+                text = response.text
+            elif hasattr(response, "candidates") and response.candidates:
+                text = response.candidates[0].content
+            else:
+                text = str(response)
+            # best-effort cache of successful response
+            try:
+                import hashlib, threading
+                cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_path = os.path.join(cache_dir, "gemini_cache.json")
+                prompt_key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                with threading.Lock():
+                    try:
+                        with open(cache_path, "r", encoding="utf-8") as cf:
+                            cache = json.load(cf)
+                    except Exception:
+                        cache = {}
+                    cache[prompt_key] = text.strip()
+                    try:
+                        with open(cache_path, "w", encoding="utf-8") as cf:
+                            json.dump(cache, cf, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return text.strip()
+        except Exception as e:
+            err_str = repr(e)
+            if "ResourceExhausted" in err_str or "quota" in err_str.lower():
+                retry_seconds = None
+                try:
+                    m = re.search(r"retry in\s*([0-9]+\.?[0-9]*)s", err_str, re.IGNORECASE)
+                    if m:
+                        retry_seconds = float(m.group(1))
+                except Exception:
+                    retry_seconds = None
+
+                if attempt < max_retries - 1:
+                    sleep_time = retry_seconds if retry_seconds is not None else backoff * (0.5 + random.random())
+                    sleep_time = min(sleep_time, 60)
+                    logger.info(f"Gemini quota error detected, attempt {attempt+1}/{max_retries}, sleeping {sleep_time}s before retry. Error: {err_str}")
+                    time.sleep(sleep_time)
+                    backoff *= 2
+                    continue
+                else:
+                    logger.warning(f"Gemini quota exhausted after {max_retries} attempts. Last error: {err_str}")
+                    # fallback to cache
+                    try:
+                        import hashlib, threading
+                        cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
+                        cache_path = os.path.join(cache_dir, "gemini_cache.json")
+                        prompt_key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                        with threading.Lock():
+                            with open(cache_path, "r", encoding="utf-8") as cf:
+                                cache = json.load(cf)
+                            if prompt_key in cache:
+                                logger.info("Returning cached Gemini response due to quota exhaustion")
+                                return f"(cached) {cache[prompt_key]}"
+                    except Exception:
+                        pass
+                    return "Service temporarily unavailable due to API quota limits. Please try again later."
+            logger.error(f"Gemini call failed: {err_str}")
+            return f"Gemini error: {err_str}"
 
 
 # ---------------------
@@ -387,18 +453,50 @@ class DocumentQA:
         text = read_document_file(file_path)
         if not text or not text.strip():
             raise ValueError("Document empty after extraction")
-        chunks = chunk_text(text, chunk_size=300, overlap=50)
+        #chunks = chunk_text(text, chunk_size=300, overlap=50)
+        chunks = chunk_text(text, chunk_size=200, overlap=30)   
         if not chunks:
             raise ValueError("No chunks created from document")
         self.index, self.chunks = build_faiss_index(chunks)
         return f"Document loaded. {len(self.chunks)} chunks indexed."
+
+    def save_index(self, dest_dir: str) -> None:
+        """Save the FAISS index and chunks to dest_dir. Creates dest_dir if missing."""
+        if not self.index or not self.chunks:
+            raise ValueError("No index/chunks to save")
+        os.makedirs(dest_dir, exist_ok=True)
+        index_path = os.path.join(dest_dir, "index.faiss")
+        chunks_path = os.path.join(dest_dir, "chunks.json")
+        # write faiss index
+        faiss.write_index(self.index, index_path)
+        # write chunks
+        with open(chunks_path, "w", encoding="utf-8") as f:
+            json.dump(self.chunks, f, ensure_ascii=False)
+
+    @staticmethod
+    def load_index_from(dir_path: str) -> 'DocumentQA':
+        """Load a persisted FAISS index and chunks from dir_path and return a DocumentQA instance."""
+        index_path = os.path.join(dir_path, "index.faiss")
+        chunks_path = os.path.join(dir_path, "chunks.json")
+        if not os.path.exists(index_path) or not os.path.exists(chunks_path):
+            raise FileNotFoundError("Index or chunks not found in provided directory")
+        # read chunks
+        with open(chunks_path, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+        # load index
+        index = faiss.read_index(index_path)
+        inst = DocumentQA()
+        inst.index = index
+        inst.chunks = chunks
+        return inst
 
     def ask_question(self, query: str) -> str:
         if not query or not query.strip():
             return "Please ask a valid question."
         if self.index is None or self.chunks is None:
             return "⚠️ Please load a document first."
-        top_chunks = search_similar_chunks(query, self.index, self.chunks, top_k=5)
+        #top_chunks = search_similar_chunks(query, self.index, self.chunks, top_k=5)
+        top_chunks = search_similar_chunks(query, self.index, self.chunks, top_k=3)
         if not top_chunks:
             return "Sorry — I cannot find the answer in the document."
         # Send to Gemini with strict context

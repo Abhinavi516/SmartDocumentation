@@ -388,7 +388,7 @@ import bcrypt
 import jwt
 from dotenv import load_dotenv
 from pymongo import MongoClient
-
+import certifi
 # Import your existing DocumentQA (unchanged) and InterviewCopilot (from smartinterview.py)
 from smartmodel import DocumentQA  # existing model import (unchanged)
 from smartinterview import InterviewCopilot  # assumes smartinterview.py is next to this file
@@ -418,24 +418,29 @@ security = HTTPBearer()  # placeholder for token checks
 # )
 # from fastapi.middleware.cors import CORSMiddleware
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# Allow frontend origin
+# Allow frontend origin(s) during development
 origins = [
-    "http://127.0.0.1:5000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
     "http://localhost:5000",
-    # add more origins if needed
+    "http://127.0.0.1:5000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # or ["*"] to allow all origins (not recommended for prod)
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],    # GET, POST, PUT, DELETE etc
-    allow_headers=["*"],    # allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
 
@@ -449,10 +454,15 @@ DB_NAME = os.getenv("DB_NAME", "smartdocq")
 JWT_SECRET = os.getenv("JWT_SECRET", "your_jwt_secret")
 JWT_EXPIRY_MINUTES = int(os.getenv("JWT_EXPIRY_MINUTES", "60"))
 
-client = MongoClient(MONGO_URI)
+#client = MongoClient(MONGO_URI)
+client = MongoClient(
+    MONGO_URI,
+    tlsCAFile=certifi.where()
+)
 db = client[DB_NAME]
 users_collection = db["users"]
 interviews_collection = db["interviews"]
+chats_collection = db["chats"]
 
 # ------------------------
 # Existing RAM QA
@@ -480,10 +490,36 @@ class LoginModel(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
+    chat_session_id: Optional[str] = None
+
+class ChatMessage(BaseModel):
+    id: str
+    type: str  # "user" or "bot"
+    content: str
+    timestamp: datetime
+
+class ChatSession(BaseModel):
+    id: str
+    title: str
+    document_name: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    messages: List[ChatMessage] = []
+    user_id: Optional[str] = None
+
+class ChatSessionResponse(BaseModel):
+    id: str
+    title: str
+    document_name: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    last_message: Optional[str] = None
+    message_count: int = 0
 
 class StartInterviewResponse(BaseModel):
     session_id: str
     questions: List[str]
+    structured_questions: Optional[List[dict]] = None
 
 class SubmitAnswersRequest(BaseModel):
     answers: List[str]
@@ -521,6 +557,19 @@ def verify_token(creds: HTTPAuthorizationCredentials = Depends(security)) -> dic
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+def verify_token_optional(creds: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[dict]:
+    """
+    Optional token verifier. Returns user payload if token is valid, None otherwise.
+    Does not raise exceptions for missing or invalid tokens.
+    """
+    if not creds:
+        return None
+    try:
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
+        return payload
+    except Exception:
+        return None
+
 def save_interview_report_to_db(session: Dict[str, Any]) -> None:
     """Save completed interview report to MongoDB interviews collection."""
     try:
@@ -539,6 +588,52 @@ def save_interview_report_to_db(session: Dict[str, Any]) -> None:
     except Exception as e:
         # Log error in production (here we just raise)
         raise
+
+def create_chat_session(title: str, document_name: Optional[str] = None, user_id: Optional[str] = None) -> str:
+    """Create a new chat session and return its ID."""
+    session_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+    
+    session_data = {
+        "id": session_id,
+        "title": title,
+        "document_name": document_name,
+        "created_at": now,
+        "updated_at": now,
+        "messages": [],
+        "user_id": user_id
+    }
+    
+    chats_collection.insert_one(session_data)
+    return session_id
+
+def add_message_to_chat(session_id: str, message_type: str, content: str) -> None:
+    """Add a message to an existing chat session."""
+    message_id = str(uuid.uuid4())
+    message_data = {
+        "id": message_id,
+        "type": message_type,
+        "content": content,
+        "timestamp": datetime.utcnow()
+    }
+    
+    chats_collection.update_one(
+        {"id": session_id},
+        {
+            "$push": {"messages": message_data},
+            "$set": {"updated_at": datetime.utcnow()}
+        }
+    )
+
+def get_chat_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve a chat session by ID."""
+    return chats_collection.find_one({"id": session_id})
+
+def get_user_chat_sessions(user_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    """Get chat sessions for a user, or all sessions if no user_id provided."""
+    query = {"user_id": user_id} if user_id else {}
+    cursor = chats_collection.find(query).sort("updated_at", -1).limit(limit)
+    return list(cursor)
 
 # ------------------------
 # Routes (existing ones largely unchanged)
@@ -615,12 +710,36 @@ async def upload_document(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 @app.post("/api/chat")
-async def chat(data: ChatRequest):
+async def chat(data: ChatRequest, creds: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     try:
         if not data.question or not data.question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
+        
+        # Get user info if authenticated (optional)
+        user_payload = verify_token_optional(creds)
+        
+        # Get or create chat session
+        session_id = data.chat_session_id
+        if not session_id:
+            # Create new session
+            session_id = create_chat_session(
+                title=f"Chat {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}",
+                user_id=user_payload.get("id") if user_payload else None
+            )
+        
+        # Add user message to chat
+        add_message_to_chat(session_id, "user", data.question)
+        
+        # Get answer from QA system
         answer = qa_system.ask_question(data.question)
-        return {"answer": answer}
+        
+        # Add bot response to chat
+        add_message_to_chat(session_id, "bot", answer)
+        
+        return {
+            "answer": answer,
+            "chat_session_id": session_id
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -631,17 +750,106 @@ def smart_check():
     return {"status": "ok"}
 
 # ------------------------
+# Chat Management Endpoints
+# ------------------------
+@app.post("/api/chat/sessions")
+async def create_chat_session_endpoint(
+    title: str = Body(...),
+    document_name: Optional[str] = Body(None),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Create a new chat session."""
+    user_payload = verify_token_optional(creds)
+    
+    session_id = create_chat_session(
+        title=title,
+        document_name=document_name,
+        user_id=user_payload.get("id") if user_payload else None
+    )
+    
+    return {"session_id": session_id}
+
+@app.get("/api/chat/sessions", response_model=List[ChatSessionResponse])
+async def get_chat_sessions(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    limit: int = 50
+):
+    """Get all chat sessions for the user."""
+    user_payload = verify_token_optional(creds)
+    
+    sessions = get_user_chat_sessions(
+        user_id=user_payload.get("id") if user_payload else None,
+        limit=limit
+    )
+    
+    response_sessions = []
+    for session in sessions:
+        last_message = ""
+        message_count = len(session.get("messages", []))
+        if message_count > 0:
+            last_message = session["messages"][-1].get("content", "")[:100]
+        
+        response_sessions.append(ChatSessionResponse(
+            id=session["id"],
+            title=session["title"],
+            document_name=session.get("document_name"),
+            created_at=session["created_at"],
+            updated_at=session["updated_at"],
+            last_message=last_message,
+            message_count=message_count
+        ))
+    
+    return response_sessions
+
+@app.get("/api/chat/sessions/{session_id}")
+async def get_chat_session_endpoint(session_id: str):
+    """Get a specific chat session with all messages."""
+    session = get_chat_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    
+    return {
+        "id": session["id"],
+        "title": session["title"],
+        "document_name": session.get("document_name"),
+        "created_at": session["created_at"],
+        "updated_at": session["updated_at"],
+        "messages": session.get("messages", [])
+    }
+
+@app.delete("/api/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    """Delete a chat session."""
+    result = chats_collection.delete_one({"id": session_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    
+    return {"message": "Chat session deleted successfully"}
+
+# ------------------------
 # Interview Endpoints (new)
 # ------------------------
 @app.post("/api/interview/start", response_model=StartInterviewResponse)
 async def start_interview(
     file: UploadFile = File(...),
-    num_questions: int = Body(..., embed=True),
-    level: str = Body(..., embed=True),
+    num_questions: int = Form(...),
+    level: Optional[str] = Form(None),
+    question_type: Optional[str] = Form(None),
     creds: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     if num_questions <= 0 or num_questions > 50:
         raise HTTPException(status_code=400, detail="num_questions must be between 1 and 50")
+
+    # Determine level: allow 'level' or map from question_type if provided
+    if question_type:
+        # normalize common qtypes to levels
+        qmap = {
+            "mcq": "easy",
+            "hr": "easy",
+            "technical": "medium",
+            "theory": "hard",
+        }
+        level = qmap.get(question_type.lower(), (level or "medium"))
 
     level = (level or "medium").lower()
     if level not in ("easy", "medium", "hard"):
@@ -672,7 +880,8 @@ async def start_interview(
     try:
         interview_bot = InterviewCopilot()
         interview_bot.load_document(file_path)
-        questions = interview_bot.generate_questions(num_questions=num_questions, level=level)
+        # Pass question_type (qtype) through for more specific generation when available
+        questions = interview_bot.generate_questions(num_questions=num_questions, level=level, qtype=question_type)
     except Exception as e:
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -686,6 +895,7 @@ async def start_interview(
         "num_questions": num_questions,
         "level": level,
         "questions": questions,
+        "structured_questions": getattr(interview_bot, "structured_questions", None),
         "interview_bot": interview_bot,  # store for later evaluation
         "answers": None,
         "feedback": None,
@@ -697,7 +907,7 @@ async def start_interview(
     if os.path.exists(file_path):
         os.remove(file_path)
 
-    return StartInterviewResponse(session_id=session_id, questions=questions)
+    return StartInterviewResponse(session_id=session_id, questions=questions, structured_questions=INTERVIEW_SESSIONS[session_id].get("structured_questions"))
 
 
 @app.post("/api/interview/{session_id}/submit")
@@ -723,7 +933,28 @@ def submit_answers(session_id: str, payload: SubmitAnswersRequest):
 
     # Evaluate answers
     try:
-        avg_score, feedback = interview_bot.evaluate_answers(answers)
+        structured = session.get("structured_questions")
+        if structured and isinstance(structured, list) and all(isinstance(s, dict) and s.get("correct") for s in structured):
+            # Quick MCQ grading using structured 'correct' field
+            feedback = []
+            total = 0
+            for idx, (q, ans) in enumerate(zip(structured, answers)):
+                correct = str(q.get("correct", "")).strip()
+                # Compare normalized strings
+                user_sel = str(ans or "").strip()
+                score = 10 if user_sel and (user_sel == correct or user_sel.startswith(correct.split(")")[0])) else 0
+                fb_text = "Correct." if score == 10 else f"Incorrect. Correct: {correct}"
+                feedback.append({
+                    "question": q.get("question", ""),
+                    "user_answer": user_sel,
+                    "score": score,
+                    "feedback": fb_text,
+                    "correct_answer": correct,
+                })
+                total += score
+            avg_score = round(total / len(structured), 2) if structured else 0
+        else:
+            avg_score, feedback = interview_bot.evaluate_answers(answers)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
 

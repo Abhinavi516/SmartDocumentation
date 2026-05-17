@@ -26,9 +26,21 @@ interface ChatSession {
   lastMessage: string;
   timestamp: Date;
   documentId: string;
+  documentName?: string;
+  messageCount: number;
 }
 
-export default function SmartDocumentation() {
+interface SmartDocumentationProps {
+  isAuthenticated: boolean;
+  userEmail: string;
+  onLogout: () => void;
+}
+
+export default function SmartDocumentation({ 
+  isAuthenticated, 
+  userEmail, 
+  onLogout 
+}: SmartDocumentationProps) {
   const API_BASE = "http://127.0.0.1:8000/api";
   const [documents, setDocuments] = useState<Document[]>([]);
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
@@ -40,11 +52,81 @@ export default function SmartDocumentation() {
   const [isSendingMessage, setIsSendingMessage] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [docLoaded, setDocLoaded] = useState<boolean>(false);
+  const [authToken, setAuthToken] = useState<string>("");
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Get auth token on mount
+  useEffect(() => {
+    getAuthToken();
+  }, []);
+
+  // Once authToken is available/changes, load chat sessions
+  useEffect(() => {
+    if (authToken) {
+      loadChatSessions();
+    }
+  }, [authToken]);
+
+  // Get authentication token from localStorage
+  const getAuthToken = (): void => {
+    const token = localStorage.getItem("token") || localStorage.getItem("authToken");
+    setAuthToken(token || "");
+  };
+
+  // Load chat sessions from backend
+  const loadChatSessions = async (): Promise<void> => {
+    try {
+      // Read latest token to avoid stale state on first render
+      const latestToken = localStorage.getItem("token") || localStorage.getItem("authToken") || authToken;
+      const headers: HeadersInit = {
+        "Content-Type": "application/json",
+      };
+      
+      if (latestToken) {
+        headers["Authorization"] = `Bearer ${latestToken}`;
+      }
+      
+      const response = await fetch(`${API_BASE}/chat/sessions`, { headers });
+      if (response.ok) {
+        const sessions = await response.json();
+        const formattedSessions: ChatSession[] = sessions.map((session: any) => ({
+          id: session.id,
+          title: session.title,
+          lastMessage: session.last_message || "",
+          timestamp: new Date(session.updated_at),
+          documentId: "1", // Default document ID
+          documentName: session.document_name,
+          messageCount: session.message_count || 0
+        }));
+        setChatSessions(formattedSessions);
+      }
+    } catch (err) {
+      console.error("Failed to load chat sessions:", err);
+    }
+  };
+
+  // Load specific chat session messages
+  const loadChatSession = async (sessionId: string): Promise<void> => {
+    try {
+      const response = await fetch(`${API_BASE}/chat/sessions/${sessionId}`);
+      if (response.ok) {
+        const session = await response.json();
+        const formattedMessages: Message[] = session.messages.map((msg: any) => ({
+          id: msg.id,
+          type: msg.type,
+          content: msg.content,
+          timestamp: new Date(msg.timestamp)
+        }));
+        setMessages(formattedMessages);
+      }
+    } catch (err) {
+      console.error("Failed to load chat session:", err);
+    }
+  };
 
   // Logout
   const handleLogout = async (): Promise<void> => {
@@ -55,6 +137,9 @@ export default function SmartDocumentation() {
       setMessages([]);
       setCurrentChatId("");
       setDocLoaded(false);
+      setAuthToken("");
+      // Call parent logout function to update global auth state
+      onLogout();
       console.log("Logged out and cache cleared");
     } catch (err) {
       console.error("Logout failed:", err);
@@ -130,10 +215,21 @@ export default function SmartDocumentation() {
     setError(null);
 
     try {
+      const headers: HeadersInit = {
+        "Content-Type": "application/json",
+      };
+      
+      if (authToken) {
+        headers["Authorization"] = `Bearer ${authToken}`;
+      }
+      
       const response = await fetch(`${API_BASE}/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: newMessage.content }),
+        headers,
+        body: JSON.stringify({ 
+          question: newMessage.content,
+          chat_session_id: currentChatId || undefined
+        }),
       });
 
       if (!response.ok) {
@@ -142,6 +238,14 @@ export default function SmartDocumentation() {
       }
 
       const data = await response.json();
+      
+      // Update current chat ID if this is a new session
+      if (data.chat_session_id && !currentChatId) {
+        setCurrentChatId(data.chat_session_id);
+        // Reload chat sessions to include the new one
+        loadChatSessions();
+      }
+      
       const botMessage: Message = {
         id: (Date.now() + 1).toString(),
         type: "bot",
@@ -166,29 +270,64 @@ export default function SmartDocumentation() {
     }
   };
 
-  const handleNewChat = (): void => {
-    const newChat: ChatSession = {
-      id: Date.now().toString(),
-      title: "New Chat",
-      lastMessage: "",
-      timestamp: new Date(),
-      documentId: documents[0]?.id || "1",
-    };
-    setChatSessions((prev) => [newChat, ...prev]);
-    setCurrentChatId(newChat.id);
-    setMessages([]);
+  const handleNewChat = async (): Promise<void> => {
+    try {
+      const headers: HeadersInit = {
+        "Content-Type": "application/json",
+      };
+      
+      if (authToken) {
+        headers["Authorization"] = `Bearer ${authToken}`;
+      }
+      
+      const response = await fetch(`${API_BASE}/chat/sessions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          title: `New Chat ${new Date().toLocaleString()}`,
+          document_name: documents[0]?.name
+        })
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        setCurrentChatId(data.session_id);
+        setMessages([]);
+        // Reload chat sessions to include the new one
+        loadChatSessions();
+      }
+    } catch (err) {
+      console.error("Failed to create new chat:", err);
+      // Fallback to local creation
+      const newChat: ChatSession = {
+        id: Date.now().toString(),
+        title: "New Chat",
+        lastMessage: "",
+        timestamp: new Date(),
+        documentId: documents[0]?.id || "1",
+        messageCount: 0
+      };
+      setChatSessions((prev) => [newChat, ...prev]);
+      setCurrentChatId(newChat.id);
+      setMessages([]);
+    }
   };
 
-  const switchChat = (chatId: string): void => {
+  const switchChat = async (chatId: string): Promise<void> => {
     setCurrentChatId(chatId);
-    setMessages([]);
+    await loadChatSession(chatId);
   };
 
   const currentChat = chatSessions.find((chat) => chat.id === currentChatId);
 
   return (
     <>
-      <Navigation onAuthModal={() => {}} isAuthenticated={true} userEmail="user@example.com" />
+      <Navigation 
+        onAuthModal={() => {}} 
+        isAuthenticated={isAuthenticated} 
+        userEmail={userEmail}
+        onLogout={handleLogout}
+      />
       <div className="flex h-screen bg-primary-bg pt-16">
         {/* Sidebar */}
         <div className="w-80 bg-card-bg border-r border-border-color flex flex-col">

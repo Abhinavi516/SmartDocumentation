@@ -9,6 +9,7 @@ import faiss
 from typing import List, Optional, Tuple
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
+import logging
 from dotenv import load_dotenv
 
 # -----------------------------
@@ -91,13 +92,22 @@ def gemini_generate(prompt: str) -> str:
     try:
         model = genai.GenerativeModel("gemini-2.0-flash")
         res = model.generate_content(prompt)
+        # Log for debugging (avoid logging prompt with secrets)
+        logging.debug("gemini_generate: received response object type: %s", type(res))
         if hasattr(res, "text") and res.text:
+            logging.debug("gemini_generate: text length=%d", len(res.text))
             return res.text.strip()
         elif hasattr(res, "candidates") and res.candidates:
-            return res.candidates[0].content.strip()
+            # candidates can be a list of candidate objects
+            first = res.candidates[0]
+            content = getattr(first, "content", None) or getattr(first, "text", None) or str(first)
+            logging.debug("gemini_generate: candidate content length=%d", len(str(content)))
+            return str(content).strip()
         else:
+            logging.debug("gemini_generate: unexpected response, returning str(res)")
             return str(res)
     except Exception as e:
+        logging.exception("gemini_generate error")
         return f"Gemini error: {repr(e)}"
 
 
@@ -112,11 +122,12 @@ class InterviewCopilot:
     3. Evaluates user answers and gives feedback
     """
 
-    def _init_(self):
+    def __init__(self):
         self.index: Optional[faiss.IndexFlatL2] = None
         self.chunks: Optional[List[str]] = None
         self.questions: List[str] = []
         self.feedback: List[dict] = []
+        self.structured_questions: Optional[List[dict]] = None
 
     # -------------------------
     # Load Document
@@ -131,13 +142,92 @@ class InterviewCopilot:
     # -------------------------
     # Question Generation
     # -------------------------
-    def generate_questions(self, num_questions: int = 5, level: str = "medium") -> List[str]:
+    def generate_questions(self, num_questions: int = 5, level: str = "medium", qtype: Optional[str] = None, **kwargs) -> List[str]:
         """Generates interview questions from document content."""
         if not self.chunks:
             raise ValueError("Please load a document first.")
+        # Support legacy 'qtype' parameter by mapping it to level if provided
+        if (level is None or str(level).strip() == "") and qtype:
+            level = qtype
 
-        context = "\n\n".join(self.chunks[:5])
-        prompt = f"""
+        context = "\n\n".join(self.chunks[:6])
+
+        # If a specific qtype is requested, ask the model for a strict JSON array of questions
+        if qtype:
+            qtype_lower = qtype.lower()
+            # build type-specific JSON schema and instruction
+            if qtype_lower == "mcq":
+                instr = (
+                    "Return a JSON array with exactly {n} MCQ objects based ONLY on the Document Context. "
+                    "Each object must have: question (string), options (array of 4 option strings labeled 'A) ...', 'B) ...'), and correct (the correct option label and text, e.g. 'B) Option text'). "
+                )
+            elif qtype_lower == "hr":
+                instr = (
+                    "Return a JSON array with exactly {n} HR (behavioral) question objects. "
+                    "Each object must have: question (string) and if helpful a short scenario field."
+                )
+            elif qtype_lower == "technical":
+                instr = (
+                    "Return a JSON array with exactly {n} Technical question objects. "
+                    "Each object must have: question (string) and difficulty ('easy'|'medium'|'hard')."
+                )
+            else:
+                instr = (
+                    "Return a JSON array with exactly {n} question objects suitable for the requested type. "
+                    "Each object must have: question (string)."
+                )
+
+            prompt = f"""
+You are an interview question generator. Follow these rules strictly.
+
+Document Context:
+{context}
+
+{instr}
+
+Return ONLY valid JSON (no surrounding text). The JSON must be an array with exactly {num_questions} elements. Example for MCQ:
+[{{"question":"...","options":["A) ...","B) ...","C) ...","D) ..."],"correct":"B) ..."}}, ...]
+""".replace("{n}", str(num_questions)).replace("{instr}", instr)
+
+            result = gemini_generate(prompt)
+
+            # Try to extract JSON from the model output
+            try:
+                match = re.search(r"\[\s*\{.*\}\s*\]", result, re.S)
+                json_text = match.group(0) if match else result
+                parsed = json.loads(json_text)
+                if isinstance(parsed, list) and len(parsed) >= 1:
+                    structured = parsed[:num_questions]
+                    # Basic validation/cleanup for MCQ
+                    if qtype_lower == "mcq":
+                        validated = []
+                        for item in structured:
+                            q = {
+                                "question": str(item.get("question", "")).strip(),
+                                "options": item.get("options") if isinstance(item.get("options"), list) else [],
+                                "correct": item.get("correct", "")
+                            }
+                            # Ensure labels for options
+                            if len(q["options"]) == 4:
+                                validated.append(q)
+                        if len(validated) >= num_questions:
+                            self.structured_questions = validated[:num_questions]
+                            self.questions = [s["question"] for s in self.structured_questions]
+                            return self.questions
+                    else:
+                        # For other types, accept parsed questions if they have 'question'
+                        validated = [ {"question": str(it.get("question", "")).strip(), **({k:v for k,v in it.items() if k!='question'} )} for it in structured if it.get("question") ]
+                        if len(validated) >= num_questions:
+                            self.structured_questions = validated[:num_questions]
+                            self.questions = [s["question"] for s in self.structured_questions]
+                            return self.questions
+            except Exception:
+                logging.debug("generate_questions: structured JSON parse failed", exc_info=True)
+
+            # If structured parse fails, continue to free-form extraction below
+        else:
+            # No qtype requested: use the previous free-form prompt
+            prompt = f"""
 You are an interview question generator.
 Generate exactly {num_questions} {level}-level interview questions based ONLY on the following document context.
 
@@ -150,14 +240,64 @@ Document Context:
 
 Return only the list of questions, one per line.
 """
-        result = gemini_generate(prompt)
+            result = gemini_generate(prompt)
 
-        # Clean up questions
-        raw_lines = [line.strip(" -0123456789.)") for line in result.split("\n") if line.strip()]
-        question_keywords = ("what", "why", "how", "when", "where", "name", "explain", "describe", "list", "define", "which", "who")
-        clean_qs = [line for line in raw_lines if line.endswith("?") or line.lower().startswith(question_keywords)]
+        # Log raw output for debugging
+        logging.info("generate_questions: gemini result length=%d", len(result) if isinstance(result, str) else 0)
+        logging.debug("generate_questions: raw result:\n%s", result)
 
-        self.questions = clean_qs[:num_questions]
+        # Attempt multiple extraction strategies to be robust against different response formats
+        clean_qs: List[str] = []
+
+        # 1) Extract numbered lines that end with a question mark, e.g. '1) What ...?'
+        try:
+            numbered = re.findall(r"(?m)^\s*\d+\s*[\).:-]*\s*(.+?\?)\s*$", result)
+            if numbered:
+                clean_qs.extend([q.strip() for q in numbered])
+        except Exception:
+            logging.debug("generate_questions: numbered extraction failed", exc_info=True)
+
+        # 2) Extract any sentence that ends with a question mark
+        try:
+            ques = re.findall(r"([^\n\r?.!]+\?)", result)
+            if ques:
+                clean_qs.extend([q.strip() for q in ques if q.strip()])
+        except Exception:
+            logging.debug("generate_questions: question mark extraction failed", exc_info=True)
+
+        # 3) Fallback: split lines and keep those that look like questions or start with question words
+        if len(clean_qs) < num_questions:
+            raw_lines = [line.strip(" -0123456789.)\t\u2022") for line in result.splitlines() if line.strip()]
+            question_keywords = ("what", "why", "how", "when", "where", "name", "explain", "describe", "list", "define", "which", "who")
+            for line in raw_lines:
+                l = line.strip()
+                if not l:
+                    continue
+                if l.endswith("?") or l.lower().startswith(question_keywords):
+                    clean_qs.append(l)
+
+        # Deduplicate while preserving order
+        seen = set()
+        deduped: List[str] = []
+        for q in clean_qs:
+            if q not in seen:
+                deduped.append(q)
+                seen.add(q)
+
+        # If still not enough, create simple fallback questions from document chunks
+        if len(deduped) < num_questions:
+            logging.info("generate_questions: insufficient questions from Gemini (%d), creating fallback questions", len(deduped))
+            for i, chunk in enumerate(self.chunks[:num_questions * 2]):
+                if len(deduped) >= num_questions:
+                    break
+                snippet = chunk.split(".")[0][:120].strip()
+                if not snippet:
+                    continue
+                fallback_q = f"Explain the following: {snippet}?"
+                if fallback_q not in deduped:
+                    deduped.append(fallback_q)
+
+        self.questions = deduped[:num_questions]
         return self.questions
 
     # -------------------------
@@ -185,23 +325,27 @@ Using the context below:
 {context}
 
 Evaluate the answer and give:
-- Score out of 10
-- Short feedback (2-3 sentences)
-Return JSON:
-{{"score": <score>, "feedback": "<feedback>"}}
+- score: integer from 0 to 10
+- short feedback: 1-2 sentences explaining strengths/weaknesses
+- correct_answer: the ideal or model answer (a concise phrase or sentence). For MCQs return the correct option letter and text (e.g. 'B) Option text').
+
+Return JSON exactly (no extra text), for example:
+{{"score": 7, "feedback": "Good explanation...", "correct_answer": "B) Option text"}}
 """
             eval_text = gemini_generate(prompt)
 
             try:
                 data = json.loads(re.search(r'\{.*\}', eval_text, re.S).group())
             except Exception:
-                data = {"score": 0, "feedback": "⚠ Could not parse Gemini response."}
+                logging.debug("evaluate_answers: failed to parse eval_text: %s", eval_text)
+                data = {"score": 0, "feedback": "⚠ Could not parse Gemini response.", "correct_answer": ""}
 
             feedback_list.append({
                 "question": q,
                 "user_answer": a,
                 "score": data.get("score", 0),
-                "feedback": data.get("feedback", "")
+                "feedback": data.get("feedback", ""),
+                "correct_answer": data.get("correct_answer", "")
             })
             total_score += data.get("score", 0)
 
